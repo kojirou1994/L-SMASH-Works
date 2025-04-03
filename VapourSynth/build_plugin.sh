@@ -10,13 +10,13 @@ git clone https://github.com/dwbuiten/obuparse.git --depth 1
 
 cd obuparse
 make -j$(nproc)
-make install-static
+sudo make install-static
 cd ..
 
 cd l-smash
 ./configure --extra-cflags=-fPIC
 make -j$(nproc)
-make install
+sudo make install
 cd ..
 
 
