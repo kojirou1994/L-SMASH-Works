@@ -6,9 +6,15 @@ set -e
 
 git clone https://github.com/HomeOfAviSynthPlusEvolution/FFmpeg -b custom-patches-for-lsmashsource --depth 1
 git clone https://github.com/vimeo/l-smash.git --depth 1
+git clone https://github.com/dwbuiten/obuparse.git --depth 1
+
+cd obuparse
+make -j$(nproc)
+make install-static
+cd ..
 
 cd l-smash
-./configure --prefix=$deps_dir --extra-cflags=-fPIC
+./configure --extra-cflags=-fPIC
 make -j$(nproc)
 make install
 cd ..
