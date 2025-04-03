@@ -23,6 +23,8 @@
 
 #include <stdio.h>
 #include <string>
+#include <utility>
+#include <vector>
 #include "lsmashsource.h"
 
 extern "C"
@@ -39,6 +41,7 @@ extern "C"
 #include "video_output.h"
 #include "audio_output.h"
 #include "lwlibav_source.h"
+#include "../common/lwlibav_audio_internal.h"
 #include "../common/lwlibav_video_internal.h"
 
 #ifdef _MSC_VER
@@ -131,7 +134,8 @@ LWLibavVideoSource::LWLibavVideoSource
     lwlibav_video_set_seek_mode              ( vdhp, seek_mode );
     lwlibav_video_set_forward_seek_threshold ( vdhp, forward_seek_threshold );
     lwlibav_video_set_preferred_decoder_names( vdhp, tokenize_preferred_decoder_names() );
-    lwlibav_video_set_prefer_hw_decoder      ( vdhp, prefer_hw_decoder );
+    set_prefer_hw( prefer_hw_decoder );
+    lwlibav_video_set_prefer_hw_decoder      ( vdhp, &prefer_hw );
     lwlibav_video_set_decoder_options        ( vdhp, ff_options );
     as_video_output_handler_t *as_vohp = (as_video_output_handler_t *)lw_malloc_zero( sizeof(as_video_output_handler_t) );
     if( !as_vohp )
@@ -185,7 +189,16 @@ LWLibavVideoSource::LWLibavVideoSource
     env->SetVar(env->Sprintf("%s", "FFSAR_DEN"), den);
     if (num > 0 && den > 0)
         env->SetVar(env->Sprintf("%s", "FFSAR"), num / static_cast<double>(den));
-    env->SetVar(env->Sprintf("%s", "LWLDECODER"), vdhp->ctx->codec->name);
+    const char* used_decoder = [&]()
+    {
+        switch (prefer_hw)
+        {
+            case 4: return "HWAccel: DXVA2";
+            case 5: return "HWAccel: D3D11VA";
+            default: return "HWAccel: VULKAN";
+        }
+    }();
+    env->SetVar(env->Sprintf("%s", "LWLDECODER"), (vdhp->ctx->hw_device_ctx) ? used_decoder : vdhp->ctx->codec->name);
 }
 
 LWLibavVideoSource::~LWLibavVideoSource()
@@ -306,6 +319,7 @@ LWLibavAudioSource::LWLibavAudioSource
     bool                progress,
     const double        drc,
     const char         *ff_options,
+    int                 fill_audio_gaps,
     IScriptEnvironment *env
 ) : LWLibavAudioSource{}
 {
@@ -327,6 +341,7 @@ LWLibavAudioSource::LWLibavAudioSource
     indicator.open   = NULL;
     indicator.update = (progress) ? update_indicator : NULL;
     indicator.close  = (progress) ? close_indicator : NULL;
+    aohp->fill_audio_gaps = fill_audio_gaps;
     /* Construct index. */
     if( lwlibav_construct_index( &lwh, vdhp.get(), vohp.get(), adhp, aohp, lhp, opt, &indicator, NULL ) < 0 )
         env->ThrowError( "LWLibavAudioSource: failed to get construct index for %s.", lwh.file_path );
@@ -336,11 +351,36 @@ LWLibavAudioSource::LWLibavAudioSource
     if( lwlibav_audio_get_desired_track( lwh.file_path, adhp, lwh.threads ) < 0 )
         env->ThrowError( "LWLibavAudioSource: failed to get the audio track." );
     prepare_audio_decoding( adhp, aohp, channel_layout, sample_rate, lwh, vi, env );
+    if (aohp->fill_audio_gaps && adhp->frame_list)
+    {
+        const audio_frame_info_t* const info = adhp->frame_list;
+        const AVRational sample_rate_tb = { 1, aohp->output_sample_rate };
+        std::vector<std::pair<int64_t, int>> gap_info_list;
+        for (int i = 1; i < adhp->frame_count; ++i)
+        {
+            if (info[i].file_offset == -1)
+                gap_info_list.emplace_back(av_rescale_q(info[i].pts, adhp->time_base, sample_rate_tb), info[i].length);
+        }
+        const int gap_count = gap_info_list.size();
+        if (gap_count > 0)
+        {
+            adhp->gap_list = (lw_audio_gap_info_t*)lw_malloc_zero(gap_count * sizeof(lw_audio_gap_info_t));
+            if (!adhp->gap_list)
+                env->ThrowError("LWLibavAudioSource: failed to allocate memory for gap list.");
+            adhp->gap_count = gap_count;
+            for (int i = 0; i < gap_count; ++i)
+            {
+                adhp->gap_list[i].pts_in_samples = gap_info_list[i].first;
+                adhp->gap_list[i].length = gap_info_list[i].second;
+            }
+        }
+    }
 }
 
 LWLibavAudioSource::~LWLibavAudioSource()
 {
     lwlibav_audio_decode_handler_t *adhp = this->adhp.get();
+    lw_free(adhp->gap_list);
     lw_free( lwlibav_audio_get_preferred_decoder_names( adhp ) );
     lw_free( lwh.file_path );
 }
@@ -365,10 +405,55 @@ void __stdcall LWLibavAudioSource::GetAudio( void *buf, int64_t start, int64_t w
     lwlibav_audio_output_handler_t *aohp = this->aohp.get();
     lw_log_handler_t *lhp = lwlibav_audio_get_log_handler( adhp );
     lhp->priv = env;
-    if( delay_audio( &start, wanted_length ) )
-        return (void)lwlibav_audio_get_pcm_samples( adhp, aohp, buf, start, wanted_length );
+    if (aohp->fill_audio_gaps)
+    {
+        if (fill_audio_gaps(buf, &start, wanted_length, adhp, aohp, vi))
+            return;
+        if (wanted_length <= 0)
+            return;
+    }
+    if (delay_audio(&start, wanted_length))
+        return (void)lwlibav_audio_get_pcm_samples(adhp, aohp, buf, start, wanted_length);
     uint8_t silence = vi.sample_type == SAMPLE_INT8 ? 128 : 0;
-    memset( buf, silence, (size_t)(wanted_length * aohp->output_block_align) );
+    memset(buf, silence, (size_t)(wanted_length * aohp->output_block_align));
+}
+
+int LWLibavAudioSource::fill_audio_gaps(void* buf, int64_t* start, int64_t wanted_length, lwlibav_audio_decode_handler_t* adhp,
+    lwlibav_audio_output_handler_t* aohp, VideoInfo& vi)
+{
+    int64_t total_gap_length = 0;
+    if (!adhp->gap_list)
+        return 0;
+    const AVRational sample_rate_tb = { 1, aohp->output_sample_rate };
+    int64_t current_start = *start;
+    for (int i = 0; i < adhp->gap_count; ++i)
+    {
+        const int64_t pts_in_samples = adhp->gap_list[i].pts_in_samples;
+        const int gap_length = adhp->gap_list[i].length;
+        if (pts_in_samples + gap_length < current_start)
+            total_gap_length += gap_length;
+        else if (pts_in_samples > current_start + wanted_length)
+            break;
+        else
+        {
+            const int64_t gap_start = pts_in_samples - current_start;
+            if (gap_start < wanted_length)
+            {
+                const int64_t fill_start = MAX(0, gap_start);
+                const int64_t fill_end = MIN(wanted_length, gap_start + gap_length);
+                const int64_t fill_length = fill_end - fill_start;
+                const uint8_t silence = vi.sample_type == SAMPLE_INT8 ? 128 : 0;
+                memset(static_cast<uint8_t*>(buf) + fill_start * aohp->output_block_align, silence,
+                    static_cast<size_t>(fill_length * aohp->output_block_align));
+                wanted_length -= fill_length;
+                current_start += fill_length;
+                if (wanted_length <= 0)
+                    return 1;
+            }
+        }
+    }
+    *start -= total_gap_length;
+    return 0;
 }
 
 static void set_av_log_level( int level )
@@ -450,7 +535,7 @@ AVSValue __cdecl CreateLWLibavVideoSource( AVSValue args, void *user_data, IScri
     seek_mode              = CLIP_VALUE( seek_mode, 0, 2 );
     forward_seek_threshold = CLIP_VALUE( forward_seek_threshold, 1, 999 );
     direct_rendering      &= (pixel_format == AV_PIX_FMT_NONE);
-    prefer_hw_decoder      = CLIP_VALUE( prefer_hw_decoder, 0, 3 );
+    prefer_hw_decoder      = CLIP_VALUE( prefer_hw_decoder, 0, 6 );
     set_av_log_level( ff_loglevel );
     return new LWLibavVideoSource( &opt, seek_mode, forward_seek_threshold,
                                    direct_rendering, pixel_format, preferred_decoder_names, prefer_hw_decoder, progress, ff_options, env );
@@ -471,6 +556,7 @@ AVSValue __cdecl CreateLWLibavAudioSource( AVSValue args, void *user_data, IScri
     const bool  progress                = args[10].AsBool( true );
     const double drc                    = args[11].AsFloat(-1.0);
     const char* ff_options              = args[12].AsString(nullptr);
+    const int  fill_audio_gaps          = args[13].AsInt(0);
     /* Set LW-Libav options. */
     lwlibav_option_t opt;
     opt.file_path         = source;
@@ -489,5 +575,6 @@ AVSValue __cdecl CreateLWLibavAudioSource( AVSValue args, void *user_data, IScri
     opt.vfr2cfr.fps_num   = 0;
     opt.vfr2cfr.fps_den   = 0;
     set_av_log_level( ff_loglevel );
-    return new LWLibavAudioSource( &opt, layout_string, sample_rate, preferred_decoder_names, progress, drc, ff_options, env );
+    return new LWLibavAudioSource( &opt, layout_string, sample_rate, preferred_decoder_names, progress, drc, ff_options,
+        fill_audio_gaps, env );
 }

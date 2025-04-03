@@ -101,6 +101,7 @@ void lwlibav_video_free_decode_handler
     av_frame_free( &vdhp->frame_buffer );
     av_frame_free( &vdhp->first_valid_frame );
     av_frame_free( &vdhp->movable_frame_buffer );
+    av_buffer_unref( &vdhp->hw_device_ctx );
     avcodec_free_context( &vdhp->ctx );
     if( vdhp->format )
         lavf_close_file( &vdhp->format );
@@ -173,7 +174,7 @@ void lwlibav_video_set_preferred_decoder_names
 void lwlibav_video_set_prefer_hw_decoder
 (
     lwlibav_video_decode_handler_t *vdhp,
-    int                             prefer_hw_decoder
+    int                            *prefer_hw_decoder
 )
 {
     vdhp->prefer_hw_decoder = prefer_hw_decoder;
@@ -288,7 +289,7 @@ int lwlibav_video_get_desired_track
      || vdhp->frame_count == 0
      || lavf_open_file( &vdhp->format, file_path, &vdhp->lh ) < 0
      || find_and_open_decoder( &ctx, vdhp->format->streams[ vdhp->stream_index ]->codecpar,
-                               vdhp->preferred_decoder_names, vdhp->prefer_hw_decoder, threads, -1.0, vdhp->ff_options ) < 0 )
+                               vdhp->preferred_decoder_names, vdhp->prefer_hw_decoder, threads, -1.0, vdhp->ff_options, vdhp->hw_device_ctx ) < 0 )
     {
         av_freep( &vdhp->index_entries );
         lw_freep( &vdhp->frame_list );
@@ -435,12 +436,23 @@ static uint32_t correct_current_frame_number
     uint32_t                        goal
 )
 {
-#define MATCH_DTS( j ) (info[j].dts == pkt->dts)
+// It's possible that the first few encoded frames all have DTS AV_NOPTS_VALUE, so we really
+// shouldn't stop when dts matches: at least we should fallback to checking POS if allowed.
+// Also note that `j` might contain side-effects, must always evaluate it exactly once!
+#define MATCH_DTS( j ) (info[j].dts == pkt->dts && (pkt->dts != AV_NOPTS_VALUE || ((vdhp->lw_seek_flags & SEEK_POS_CORRECTION) == 0)))
 #define MATCH_POS( j ) ((vdhp->lw_seek_flags & SEEK_POS_CORRECTION) && info[j].file_offset == pkt->pos)
     order_converter_t  *oc   = vdhp->order_converter;
     video_frame_info_t *info = vdhp->frame_list;
     uint32_t p = oc ? oc[i].decoding_to_presentation : i;
-    if( pkt->dts == AV_NOPTS_VALUE || MATCH_DTS( p ) || MATCH_POS( p ) )
+    // It is possible that the first frame has dts == AV_NOPTS_VALUE and we happen to seek to frame 0,
+    // even when rap is strictly > 0. This happens with recent mkvmerge versions where the #cuepoints
+    // are dramatically cut down and thus av_seek_frame is much less accurate and might give us a (much)
+    // earlier frame.
+    // Therefore, we should not just give up when dts == AV_NOPTS_VALUE, and we have to also check some
+    // others fields, especially when lw_seek_flags is more than just SEEK_DTS_BASED.
+    int undef_timestamp = (vdhp->ctx->codec_id == AV_CODEC_ID_VC1) ? pkt->dts == AV_NOPTS_VALUE :
+        (pkt->dts == AV_NOPTS_VALUE && ((vdhp->lw_seek_flags & ~SEEK_DTS_BASED) == 0));
+    if( undef_timestamp || MATCH_DTS( p ) || MATCH_POS( p ) )
         return i;
     if( pkt->dts > info[p].dts )
     {
@@ -490,47 +502,106 @@ static int decode_video_picture
     /* Get a packet containing a frame. */
     uint32_t picture_number = *current;
     AVPacket *pkt = &vdhp->packet;
-    int ret = lwlibav_get_av_frame( vdhp->format, vdhp->stream_index, picture_number, pkt );
-    if( ret > 0 )
-        return ret;
-    /* Correct the current picture number in order to match DTS since libavformat might have sought wrong position. */
-    uint32_t correction_distance = 0;
-    if( picture_number == rap_number && (vdhp->lw_seek_flags & SEEK_DTS_BASED) )
+    AVFrame* mov_frame = NULL;
+    int get_new_pkt = 0;
+    int ret = 0;
+    do
     {
-        picture_number = correct_current_frame_number( vdhp, pkt, picture_number, goal );
-        if( picture_number == 0
-         || picture_number > rap_number )
-            return -2;
-        if( *current > picture_number )
-            /* It seems we got a more backward frame rather than what we requested. */
-            correction_distance = *current - picture_number;
-        *current = picture_number;
+        get_new_pkt = 0;
+        if (!vdhp->reuse_pkt)
+        {
+            ret = lwlibav_get_av_frame(vdhp->format, vdhp->stream_index, pkt);
+            if (ret > 0)
+                return ret;
+            /* Correct the current picture number in order to match DTS since libavformat might have sought wrong position. */
+            uint32_t correction_distance = 0;
+            if (picture_number == rap_number && (vdhp->lw_seek_flags & (SEEK_DTS_BASED | SEEK_PTS_BASED)))
+            {
+                picture_number = correct_current_frame_number(vdhp, pkt, picture_number, goal);
+                if (picture_number == 0
+                    || picture_number > rap_number)
+                    return -2;
+                if (*current > picture_number)
+                    /* It seems we got a more backward frame rather than what we requested. */
+                    correction_distance = *current - picture_number;
+                *current = picture_number;
+            }
+            if (pkt->flags & AV_PKT_FLAG_KEY)
+                vdhp->last_rap_number = picture_number;
+            /* Avoid decoding frames until the seek correction caused by too backward is done. */
+            while (correction_distance)
+            {
+                ret = lwlibav_get_av_frame(vdhp->format, vdhp->stream_index, pkt);
+                if (ret > 0)
+                    return ret;
+                if (pkt->flags & AV_PKT_FLAG_KEY)
+                    vdhp->last_rap_number = picture_number;
+                *current = picture_number;
+                --correction_distance;
+            }
+            set_output_order_id(vdhp, pkt, picture_number);
+        }
+        /* Decode a frame in a packet. */
+        mov_frame = vdhp->movable_frame_buffer;
+        av_frame_unref(mov_frame);
+        int retry_send = 0;
+        do
+        {
+            retry_send = 0;
+            ret = decode_video_packet(vdhp->ctx, mov_frame, got_picture, pkt);
+            if (ret == AVERROR(EAGAIN))
+            {
+                // Drain frames, and *check* if they are the requested frame.
+                int drain_ret;
+                do
+                {
+                    drain_ret = avcodec_receive_frame(vdhp->ctx, mov_frame);
+                    if (drain_ret >= 0)
+                    {
+                        // We got a frame during draining! Check if it's the one we want.
+                        uint32_t estimated_picture_number = (uint32_t)get_output_order_id(mov_frame) + vdhp->exh.delay_count;
+                        if (estimated_picture_number == goal && !vdhp->reuse_pkt)
+                        {
+                            vdhp->reuse_pkt = 1;
+                            // It's the requested frame (or its counterpart)!  Move it to the output.
+                            *got_picture = 1;
+                            ret = 0;
+                            goto got_frame;
+                        }
+                        av_frame_unref(mov_frame); // Not the one we want, discard.
+                    }
+                }
+                while (drain_ret >= 0);
+                if (drain_ret == AVERROR(EAGAIN))
+                    retry_send = 1;
+                else if (drain_ret < 0 && drain_ret != AVERROR_EOF)
+                    return drain_ret;
+            }
+            else if (ret < 0)
+                break;
+            else if (vdhp->reuse_pkt)
+            {
+                vdhp->reuse_pkt = 0;
+                get_new_pkt = 1;
+            }
+            else
+                break;
+        }
+        while (retry_send);
     }
-    if( pkt->flags & AV_PKT_FLAG_KEY )
-        vdhp->last_rap_number = picture_number;
-    /* Avoid decoding frames until the seek correction caused by too backward is done. */
-    while( correction_distance )
-    {
-        ret = lwlibav_get_av_frame( vdhp->format, vdhp->stream_index, ++picture_number, pkt );
-        if( ret > 0 )
-            return ret;
-        if( pkt->flags & AV_PKT_FLAG_KEY )
-            vdhp->last_rap_number = picture_number;
-        *current = picture_number;
-        --correction_distance;
-    }
-    /* Decode a frame in a packet. */
-    AVFrame *mov_frame = vdhp->movable_frame_buffer;
-    av_frame_unref( mov_frame );
-    set_output_order_id( vdhp, pkt, picture_number );
-    ret = decode_video_packet( vdhp->ctx, mov_frame, got_picture, pkt );
+    while (get_new_pkt);
+got_frame:
     vdhp->last_fed_picture_number = picture_number;
     /* We can't get the requested frame by feeding a picture if that picture is field coded.
      * This branch avoids putting empty data on the frame buffer. */
     if( *got_picture )
     {
         av_frame_unref( frame );
-        av_frame_move_ref( frame, mov_frame );
+        if (transfer_frame_data(frame, mov_frame))
+        {
+            lw_log_show(&vdhp->lh, LW_LOG_ERROR, "Failed to transfer a video frame.");
+            return -1;
+        }
         vdhp->last_dec_frame = frame;
     }
     *pkt_pts = pkt->pts;
@@ -687,6 +758,8 @@ static uint32_t seek_video
     uint32_t goal = presentation_picture_number + decoder_delay;
     exhp->delay_count     = 0;
     vdhp->last_half_frame = 0;
+    if (vdhp->reuse_pkt)
+        vdhp->reuse_pkt = 0;
     for( current = rap_number; current <= goal; current++ )
     {
         int64_t pkt_pts;
@@ -864,9 +937,14 @@ static int get_frame
                 uint32_t picture_number = (uint32_t)output_id;
                 vdhp->last_half_frame = is_half_frame( vdhp, picture_number );
                 correct_output_delay( vdhp, &goal, picture_number, estimated_picture_number );
-                if( picture_number == requested_picture_number )
+                if (picture_number == requested_picture_number)
+                {
+                    vdhp->last_half_frame = is_half_frame(vdhp, picture_number);
+                    vdhp->last_frame_number = picture_number;
+                    vdhp->last_req_frame = frame;
                     /* Got the requested output frame. */
                     return 0;
+                }
                 else if( vdhp->last_half_frame && (picture_number == requested_picture_number + 1)
                       && field_number_of_picture_in_frame( vdhp, frame, picture_number ) == 2 )
                     /* Got the requested output frame but the output timestamp is from one of the second displayed field. */
@@ -948,9 +1026,15 @@ static int get_frame
             }
             AVPacket pkt = { 0 };
             av_frame_unref( frame );
-            if( decode_video_packet( vdhp->ctx, frame, &got_picture, &pkt ) < 0 )
+            AVFrame* mov_frame = vdhp->movable_frame_buffer;
+            if( decode_video_packet( vdhp->ctx, mov_frame, &got_picture, &pkt ) < 0 )
             {
                 lw_log_show( &vdhp->lh, LW_LOG_ERROR, "Failed to decode and flush a video frame." );
+                return -1;
+            }
+            if (transfer_frame_data(frame, mov_frame))
+            {
+                lw_log_show(&vdhp->lh, LW_LOG_ERROR, "Failed to transfer a video frame.");
                 return -1;
             }
             vdhp->last_fed_picture_number = current;
@@ -1287,6 +1371,14 @@ static uint32_t lwlibav_vfr2cfr
     uint32_t                        frame_number
 )
 {
+    if (vdhp->lw_seek_flags & SEEK_PTS_GENERATED)
+    {
+        // 'frame_number' is the 1-based output frame number [1, vohp->frame_count]
+        uint32_t source_frame_number = (uint32_t)(((uint64_t)(frame_number - 1) * vdhp->frame_count) / vohp->frame_count) + 1;
+        source_frame_number = MIN(source_frame_number, vdhp->frame_count);
+        vdhp->last_ts_frame_number = source_frame_number; // Update the cache hint
+        return source_frame_number;
+    }
     /* Convert VFR to CFR. */
     double target_ts  = (double)((uint64_t)(frame_number - 1) * vohp->cfr_den) / vohp->cfr_num;
     double current_ts = DBL_MAX;
@@ -1468,11 +1560,16 @@ int lwlibav_video_find_first_valid_frame
     AVPacket *pkt = &vdhp->packet;
     for( uint32_t i = 1; i <= vdhp->frame_count + vdhp->exh.delay_count; i++ )
     {
-        lwlibav_get_av_frame( vdhp->format, vdhp->stream_index, i, pkt );
+        lwlibav_get_av_frame( vdhp->format, vdhp->stream_index, pkt );
         av_frame_unref( vdhp->frame_buffer );
         set_output_order_id( vdhp, pkt, i );
         int got_picture;
-        int ret = decode_video_packet( vdhp->ctx, vdhp->frame_buffer, &got_picture, pkt );
+        int ret = decode_video_packet( vdhp->ctx, vdhp->movable_frame_buffer, &got_picture, pkt );
+        if (transfer_frame_data(vdhp->frame_buffer, vdhp->movable_frame_buffer))
+        {
+            lw_log_show(&vdhp->lh, LW_LOG_ERROR, "Failed to transfer a video frame.");
+            return -1;
+        }
         /* Handle decoder delay derived from PAFF field coded pictures. */
         if( i <= vdhp->frame_count && i > decoder_delay
          && !got_picture && vdhp->frame_list[i].repeat_pict == 0 )
@@ -1569,7 +1666,7 @@ int try_decode_video_frame
         int extradata_index = vdhp->frame_list[frame_number].extradata_index;
         if( extradata_index != vdhp->exh.current_index )
             break;
-        int ret = lwlibav_get_av_frame( format_ctx, stream_index, frame_number, &pkt );
+        int ret = lwlibav_get_av_frame( format_ctx, stream_index, &pkt );
         if( ret > 0 )
             break;
         else if( ret < 0 )

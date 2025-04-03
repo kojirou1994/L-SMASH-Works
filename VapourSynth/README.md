@@ -52,6 +52,10 @@
                 Output frame rate numerator for VFR->CFR (Variable Frame Rate to Constant Frame Rate) conversion.
                 If frame rate is set to a valid value, the conversion is achieved by padding and/or dropping frames at the specified frame rate.
                 Otherwise, output frame rate is set to a computed average frame rate and the output process is performed by actual frame-by-frame.
+
+				NOTE: You must explicitly set this if the source is an AVI file that contains null/drop frames that you would like to keep. For
+				example, AVI files captured using VirtualDub commonly contain null/drop frames that were inserted during the capture process.
+				Unless you provide this parameter, these null frames will be discarded, commonly resulting in loss of audio/video sync.
             + fpsden (default : 1)
                 Output frame rate denominator for VFR->CFR (Variable Frame Rate to Constant Frame Rate) conversion.
                 See 'fpsnum' in details.
@@ -89,7 +93,7 @@
                     "RGB48"
                     "RGB64BE"
                     "XYZ12LE"
-            + decoder (defalut : "")
+            + decoder (default : "")
                 Names of preferred decoder candidates separated by comma.
                 For instance, if you prefer to use the 'h264_qsv' and 'mpeg2_qsv' decoders instead of the generally
                 used 'h264' and 'mpeg2video' decoder, then specify as "h264_qsv,mpeg2_qsv". The evaluations are done
@@ -100,7 +104,10 @@
                     - 0 : Use default software decoder.
                     - 1 : Use NVIDIA CUVID acceleration for supported codec, otherwise use default software decoder.
                     - 2 : Use Intel Quick Sync Video acceleration for supported codec, otherwise use default software decoder.
-                    - 3 : Try hardware decoder in the order of CUVID->QSV. If none is available then use default software decoder.
+                    - 3 : Try hardware decoder in the order of CUVID->QSV->DXVA2->D3D11VA->VULKAN. If none is available then use default software decoder.
+                    - 4 : Use DXVA2 hardware acceleration for supported codec, otherwise use default software decoder.
+                    - 5 : Use D3D11 hardware acceleration for supported codec, otherwise use default software decoder.
+                    - 6 : Use VULKAN hardware acceleration for supported codec, otherwise use default software decoder.
             + ff_loglevel (default : 0)
                 Set the log level in FFmpeg.
                     - 0 : AV_LOG_QUIET
@@ -166,6 +173,7 @@
                 If set to 1, and source file requested repeat and the filter is unable to obey the request, this filter will fail explicitly to eliminate any guesswork.
                 If set to 2, and source file requested repeat and the filter is unable to obey the request, silently returning a VFR clip with a constant (but wrong) fps.
                 Note that this option is ignored when VFR->CFR conversion is enabled.
+                Note that if the source is fake interlaced, this option must be set to false.
             + dominance : (default : 0)
                 Which field, top or bottom, is displayed first.
                     - 0 : Obey source flags
@@ -174,7 +182,7 @@
                 This option is enabled only if one or more of the following conditions is true.
                     - 'repeat' is set to 1.
                     - There is a video frame consisting of two separated field coded pictures.
-            + decoder (defalut : "")
+            + decoder (default : "")
                 Same as 'decoder' of LibavSMASHSource().
             + prefer_hw (default : 0)
                 Same as 'prefer_hw' of LibavSMASHSource().
@@ -182,5 +190,5 @@
                 Same as 'ff_loglevel' of LibavSMASHSource().
             + cachedir (default : "")
                 Create *.lwi file under this directory with names encoding the full path to avoid collisions.
-            + ff_options (defalut: "")
+            + ff_options (default: "")
                 Same as 'ff_options' of LibavSMASHSource().

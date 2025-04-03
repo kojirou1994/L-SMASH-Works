@@ -61,6 +61,8 @@ extern "C"
 #include <windows.h>
 #endif
 
+#include "lwindex_sscanf_unrolled.h"
+
 typedef struct
 {
     lwlibav_extradata_handler_t exh;
@@ -86,10 +88,11 @@ typedef struct
     int                number_of_helpers;
     lwindex_helper_t **helpers;
     const char       **preferred_video_decoder_names;
-    int                prefer_video_hw_decoder;
+    int               *prefer_video_hw_decoder;
     const char       **preferred_audio_decoder_names;
     int                thread_count;
     char              *format_name;
+    AVBufferRef       *hw_device_ctx;
 } lwindex_indexer_t;
 
 typedef struct
@@ -832,6 +835,8 @@ static void compute_stream_duration
     if( !(lwhp->format_flags & AVFMT_TS_DISCONT)
      && (vdhp->lw_seek_flags & (SEEK_PTS_BASED | SEEK_PTS_GENERATED)) )
     {
+        if (vdhp->lw_seek_flags & SEEK_PTS_GENERATED)
+            goto fail;
         first_ts          = info[1].pts;
         largest_ts        = first_ts;
         second_largest_ts = first_ts;
@@ -958,7 +963,8 @@ static void create_video_frame_order_list
 (
     lwlibav_video_decode_handler_t *vdhp,
     lwlibav_video_output_handler_t *vohp,
-    lwlibav_option_t               *opt
+    lwlibav_option_t               *opt,
+    int consistent_field_and_repeat
 )
 {
     /* Eliminate guesswork: first determine if repeat is requested in the source. */
@@ -982,6 +988,11 @@ static void create_video_frame_order_list
     /* Check repeat_pict and order_count. */
     if( specified_field_dominance > 0 && (lw_field_info_t)specified_field_dominance != info[1].field_info )
         ++order_count;
+    if (consistent_field_and_repeat && !info[1].repeat_pict)
+    {
+        for (uint32_t i = 1; i < vdhp->frame_count; ++i)
+            info[i].repeat_pict = 1;
+    }
     int             enable_repeat   = 0;
     int             complete_frame  = 1;
     int             repeat_field    = 1;
@@ -1337,7 +1348,7 @@ static lwindex_helper_t *get_index_helper
         const char **preferred_decoder_names = codecpar->codec_type == AVMEDIA_TYPE_VIDEO
                                              ? indexer->preferred_video_decoder_names
                                              : indexer->preferred_audio_decoder_names;
-        if( find_and_open_decoder( &helper->codec_ctx, codecpar, preferred_decoder_names, indexer->prefer_video_hw_decoder, indexer->thread_count, -1.0, 0 ) < 0 )
+        if( find_and_open_decoder( &helper->codec_ctx, codecpar, preferred_decoder_names, indexer->prefer_video_hw_decoder, indexer->thread_count, -1.0, 0, indexer->hw_device_ctx ) < 0 )
             /* Failed to find and open an appropriate decoder, but do not abort indexing. */
             return helper;
         helper->mpeg12_video = (codecpar->codec_id == AV_CODEC_ID_MPEG1VIDEO || codecpar->codec_id == AV_CODEC_ID_MPEG2VIDEO);
@@ -2097,7 +2108,7 @@ static int create_index
     }
     /*
         # Structure of Libav reader index file
-        <LibavReaderIndexFile=17>
+        <LibavReaderIndexFile=18>
         <InputFilePath>foobar.omo</InputFilePath>
         <FileSize=1048576>
         <FileLastModificationTime=000>
@@ -2106,12 +2117,14 @@ static int create_index
         <ActiveVideoStreamIndex>+0000000000</ActiveVideoStreamIndex>
         <ActiveAudioStreamIndex>-0000000001</ActiveAudioStreamIndex>
         <DefaultAudioStreamIndex>-0000000001</DefaultAudioStreamIndex>
+        <FillAudioGaps>0</FillAudioGaps>
         <StreamInfo=0,0>
         Codec=2,TimeBase=1001/24000,Width=1920,Height=1080,Format=yuv420p,ColorSpace=5
         </StreamInfo>
         Index=0,POS=0,PTS=2002,DTS=0,EDI=0
         Key=1,Pic=1,POC=0,Repeat=1,Field=0
         </LibavReaderIndex>
+        <VideoConsistentFieldRepeatPict>1</VideoConsistentFieldRepeatPict>
         <StreamDuration=0,0>5000</StreamDuration>
         <StreamIndexEntries=0,0,1>
         POS=0,TS=2002,Flags=1,Size=1024,Distance=0
@@ -2185,6 +2198,7 @@ static int create_index
         audio_index_pos = ftell( index );
         fprintf( index, "<ActiveAudioStreamIndex>%+011d</ActiveAudioStreamIndex>\n", adhp->stream_index );
         fprintf(index, "<DefaultAudioStreamIndex>%+011d</DefaultAudioStreamIndex>\n", -1);
+        fprintf(index, "<FillAudioGaps>%d</FillAudioGaps>\n", aohp->fill_audio_gaps);
     }
     AVPacket pkt = { 0 };
     int       pix_fmt_investigated  = 0;
@@ -2200,6 +2214,8 @@ static int create_index
     uint64_t  audio_duration        = 0;
     int64_t   first_dts             = AV_NOPTS_VALUE;
     int64_t   filesize              = avio_size( format_ctx->pb );
+    int       consistent_repeat_pict = 1;
+    int       consistent_field_order = 1;
     if( indicator->open )
         indicator->open( php );
     /* Start to read frames and write the index file. */
@@ -2211,7 +2227,8 @@ static int create_index
         vdhp->prefer_hw_decoder,        /* prefer_video_hw_decoder */
         adhp->preferred_decoder_names,  /* preferred_audio_decoder_names */
         lwhp->threads,                  /* thread_count */
-        lwhp->format_name               /* format_name */
+        lwhp->format_name,              /* format_name */
+        vdhp->hw_device_ctx             /* hw device buffer */
     };
     for( unsigned int stream_index = 0; stream_index < format_ctx->nb_streams; stream_index++ )
     {
@@ -2378,6 +2395,17 @@ static int create_index
             {
                 ++video_sample_count;
                 video_frame_info_t *info = &video_info[video_sample_count];
+                if (pkt_ctx->codec_id != AV_CODEC_ID_VP8 && pkt_ctx->codec_id != AV_CODEC_ID_VP9)
+                {
+                    if (video_sample_count > 1)
+                    {
+                        const  video_frame_info_t* const first_info = &video_info[1];
+                        if (consistent_repeat_pict && repeat_pict != first_info->repeat_pict)
+                            consistent_repeat_pict = 0;
+                        if (consistent_field_order && field_info != first_info->field_info)
+                            consistent_field_order = 0;
+                    }
+                }
                 memset( info, 0, sizeof(video_frame_info_t) );
                 info->pts             = pkt.pts;
                 info->dts             = pkt.dts;
@@ -2480,76 +2508,106 @@ static int create_index
             int bits_per_sample = pkt_ctx->bits_per_raw_sample   > 0 ? pkt_ctx->bits_per_raw_sample
                                 : pkt_ctx->bits_per_coded_sample > 0 ? pkt_ctx->bits_per_coded_sample
                                 : av_get_bytes_per_sample( pkt_ctx->sample_fmt ) << 3;
+            if (adhp->time_base.num == 0 || adhp->time_base.den == 0)
+            {
+                adhp->time_base.num = stream->time_base.num;
+                adhp->time_base.den = stream->time_base.den;
+            }
             /* Get audio frame_length. */
             int frame_length = get_audio_frame_length( helper, pkt_ctx, &pkt );
-            /* Set audio frame info if this stream is active. */
-            if( pkt.stream_index == adhp->stream_index )
+            int gaps = 1;
+            int added_gaps = 0;
+            while (gaps--)
             {
-                if( frame_length != -1 )
-                    audio_duration += frame_length;
-                if( audio_duration <= INT32_MAX )
+                /* Set audio frame info if this stream is active. */
+                if (pkt.stream_index == adhp->stream_index)
                 {
-                    /* Set up audio frame info. */
-                    ++audio_sample_count;
-                    audio_frame_info_t *info = &audio_info[audio_sample_count];
-                    memset( info, 0, sizeof(audio_frame_info_t) );
-                    info->pts             = pkt.pts;
-                    info->dts             = pkt.dts;
-                    info->file_offset     = pkt.pos;
-                    info->sample_number   = audio_sample_count;
-                    info->extradata_index = extradata_index;
-                    info->sample_rate     = pkt_ctx->sample_rate;
-                    if( frame_length != -1 && audio_sample_count > helper->delay_count )
+                    if (frame_length != -1)
+                        audio_duration += frame_length;
+                    if (audio_duration <= INT32_MAX)
                     {
-                        uint32_t audio_frame_number = audio_sample_count - helper->delay_count;
-                        audio_info[audio_frame_number].length = frame_length;
-                        if( audio_frame_number > 1 && audio_info[audio_frame_number].length != audio_info[audio_frame_number - 1].length )
-                            constant_frame_length = 0;
-                    }
-                    if( audio_sample_rate == 0 )
-                        audio_sample_rate = pkt_ctx->sample_rate;
-                    if( audio_sample_count + 1 == audio_info_count )
-                    {
-                        audio_info_count <<= 1;
-                        audio_frame_info_t *temp = (audio_frame_info_t *)realloc( audio_info, audio_info_count * sizeof(audio_frame_info_t) );
-                        if( !temp )
+                        /* Set up audio frame info. */
+                        ++audio_sample_count;
+                        audio_frame_info_t* info = &audio_info[audio_sample_count];
+                        memset(info, 0, sizeof(audio_frame_info_t));
+                        info->pts = pkt.pts;
+                        info->dts = pkt.dts;
+                        info->file_offset = pkt.pos;
+                        info->sample_number = audio_sample_count;
+                        info->extradata_index = extradata_index;
+                        info->sample_rate = pkt_ctx->sample_rate;
+                        if (frame_length != -1 && audio_sample_count > helper->delay_count)
                         {
-                            av_packet_unref( &pkt );
-                            goto fail_index;
+                            const uint32_t audio_frame_number = audio_sample_count - helper->delay_count;
+                            audio_info[audio_frame_number].length = frame_length;
+                            if (audio_frame_number > 1 && audio_info[audio_frame_number].length != audio_info[audio_frame_number - 1].length)
+                                constant_frame_length = 0;
+                            if (aohp->fill_audio_gaps && audio_sample_count > 1 && !added_gaps)
+                            {
+                                const audio_frame_info_t* const prev_info = &audio_info[audio_sample_count - 1];
+                                const int64_t prev_pts = prev_info->pts;
+                                if (info->pts != AV_NOPTS_VALUE && prev_pts != AV_NOPTS_VALUE)
+                                {
+                                    const int64_t prev_duration = av_rescale_q(prev_info->length, (AVRational) { 1, aohp->output_sample_rate },
+                                        adhp->time_base);
+                                    const int64_t prev_end = prev_pts + prev_duration;
+                                    const int64_t time_diff = info->pts - prev_end;
+                                    if (time_diff > aohp->fill_audio_gaps)
+                                    {
+                                        info->length = (int)av_rescale_q(time_diff, adhp->time_base, (AVRational) { 1, aohp->output_sample_rate });
+                                        info->pts = prev_end;
+                                        info->dts = prev_info->dts + prev_duration;
+                                        info->file_offset = -1;
+                                        print_index(index, "Index=%d,POS=%" PRId64 ",PTS=%" PRId64 ",DTS=%" PRId64 ",EDI=%d\n"
+                                            "Length=%d\n",
+                                            pkt.stream_index, info->file_offset, info->pts, info->dts, extradata_index,
+                                            info->length);
+                                        gaps++;
+                                        added_gaps++;
+                                    }
+                                }
+                            }
                         }
-                        audio_info = temp;
+                        if (audio_sample_rate == 0)
+                            audio_sample_rate = pkt_ctx->sample_rate;
+                        if (audio_sample_count + 1 == audio_info_count)
+                        {
+                            audio_info_count <<= 1;
+                            audio_frame_info_t* temp = (audio_frame_info_t*)realloc(audio_info, audio_info_count * sizeof(audio_frame_info_t));
+                            if (!temp)
+                            {
+                                av_packet_unref(&pkt);
+                                goto fail_index;
+                            }
+                            audio_info = temp;
+                        }
+                        if (pkt_ctx->ch_layout.nb_channels > aohp->output_channel_layout.nb_channels)
+                            av_channel_layout_copy(&aohp->output_channel_layout, &pkt_ctx->ch_layout);
+                        aohp->output_sample_format = select_better_sample_format(aohp->output_sample_format, pkt_ctx->sample_fmt);
+                        aohp->output_sample_rate = MAX(aohp->output_sample_rate, audio_sample_rate);
+                        aohp->output_bits_per_sample = MAX(aohp->output_bits_per_sample, bits_per_sample);
                     }
-                    if (pkt_ctx->ch_layout.nb_channels > aohp->output_channel_layout.nb_channels)
-                        av_channel_layout_copy(&aohp->output_channel_layout, &pkt_ctx->ch_layout);
-                    aohp->output_sample_format   = select_better_sample_format( aohp->output_sample_format, pkt_ctx->sample_fmt );
-                    aohp->output_sample_rate     = MAX( aohp->output_sample_rate, audio_sample_rate );
-                    aohp->output_bits_per_sample = MAX( aohp->output_bits_per_sample, bits_per_sample );
                 }
-                if( adhp->time_base.num == 0 || adhp->time_base.den == 0 )
+                /* Set channel_layout, sample_rate, sample_format and bits_per_sample for the current extradata. */
+                if (extradata_index >= 0)
                 {
-                    adhp->time_base.num = stream->time_base.num;
-                    adhp->time_base.den = stream->time_base.den;
+                    lwlibav_extradata_handler_t* list = &helper->exh;
+                    lwlibav_extradata_t* entry = &list->entries[list->current_index];
+                    if (entry->channel_layout == 0)
+                        entry->channel_layout = pkt_ctx->ch_layout.u.mask;
+                    if (entry->sample_rate == 0)
+                        entry->sample_rate = pkt_ctx->sample_rate;
+                    if (entry->sample_format == AV_SAMPLE_FMT_NONE)
+                        entry->sample_format = pkt_ctx->sample_fmt;
+                    if (entry->bits_per_sample == 0)
+                        entry->bits_per_sample = bits_per_sample;
+                    if (entry->block_align == 0)
+                        entry->block_align = pkt_ctx->block_align;
+                    if (entry->codec_id == AV_CODEC_ID_NONE)
+                        entry->codec_id = pkt_ctx->codec_id;
+                    if (entry->codec_tag == 0)
+                        entry->codec_tag = pkt_ctx->codec_tag;
                 }
-            }
-            /* Set channel_layout, sample_rate, sample_format and bits_per_sample for the current extradata. */
-            if( extradata_index >= 0 )
-            {
-                lwlibav_extradata_handler_t *list = &helper->exh;
-                lwlibav_extradata_t *entry = &list->entries[ list->current_index ];
-                if( entry->channel_layout == 0 )
-                    entry->channel_layout = pkt_ctx->ch_layout.u.mask;
-                if( entry->sample_rate == 0 )
-                    entry->sample_rate = pkt_ctx->sample_rate;
-                if( entry->sample_format == AV_SAMPLE_FMT_NONE )
-                    entry->sample_format = pkt_ctx->sample_fmt;
-                if( entry->bits_per_sample == 0 )
-                    entry->bits_per_sample = bits_per_sample;
-                if( entry->block_align == 0 )
-                    entry->block_align = pkt_ctx->block_align;
-                if( entry->codec_id == AV_CODEC_ID_NONE )
-                    entry->codec_id = pkt_ctx->codec_id;
-                if( entry->codec_tag == 0 )
-                    entry->codec_tag = pkt_ctx->codec_tag;
             }
             /* Write an audio packet info to the index file. */
             print_index( index, "Index=%d,POS=%" PRId64 ",PTS=%" PRId64 ",DTS=%" PRId64 ",EDI=%d\n"
@@ -2617,6 +2675,8 @@ static int create_index
         }
     }
     print_index( index, "</LibavReaderIndex>\n" );
+    const int consistent_field_and_repeat = consistent_field_order && consistent_repeat_pict;
+    print_index(index, "<VideoConsistentFieldRepeatPict>%d</VideoConsistentFieldRepeatPict>\n", consistent_field_and_repeat);
     /* Deallocate video frame info if no active video stream. */
     if( vdhp->stream_index < 0 )
         lw_freep( &video_info );
@@ -2810,7 +2870,7 @@ static int create_index
         /* Compute the stream duration. */
         compute_stream_duration( lwhp, vdhp, format_ctx->streams[ vdhp->stream_index ]->duration );
         /* Create the repeat control info. */
-        create_video_frame_order_list( vdhp, vohp, opt );
+        create_video_frame_order_list( vdhp, vohp, opt, consistent_field_and_repeat );
         /* Exclude invisible frames from the output handler. */
         create_video_visible_frame_list( vdhp, vohp, invisible_count );
     }
@@ -2940,10 +3000,12 @@ static int parse_index
     if( fscanf( index, "<LibavReaderIndex=0x%x,%d,%[^>]>\n",
                 (unsigned int *)&lwhp->format_flags, &lwhp->raw_demuxer, format_name ) != 3 )
         return -1;
+    int fill_audio_gaps;
     int32_t active_index_pos = ftell( index );
     if( fscanf( index, "<ActiveVideoStreamIndex>%d</ActiveVideoStreamIndex>\n", &active_video_index ) != 1
      || fscanf( index, "<ActiveAudioStreamIndex>%d</ActiveAudioStreamIndex>\n", &active_audio_index ) != 1
-     || fscanf( index, "<DefaultAudioStreamIndex>%d</DefaultAudioStreamIndex>\n", &default_audio ) != 1 )
+     || fscanf( index, "<DefaultAudioStreamIndex>%d</DefaultAudioStreamIndex>\n", &default_audio ) != 1 
+     || fscanf( index, "<FillAudioGaps>%d</FillAudioGaps>\n", &fill_audio_gaps ) != 1 )
         return -1;
     lwhp->format_name = format_name;
     adhp->dv_in_avi = !strcmp( lwhp->format_name, "avi" ) ? -1 : 0;
@@ -2982,8 +3044,13 @@ static int parse_index
         if( !audio_info )
             goto fail_parsing;
     }
-    if( active_audio_index == -2 && opt->force_audio_index != -2 )
+    if( active_audio_index == -2 && opt->force_audio_index != -2 ) // Maybe redundant.
         goto fail_parsing;
+    if (opt->force_audio_index != -2)
+    {
+        if (fill_audio_gaps != aohp->fill_audio_gaps)
+            goto fail_parsing;
+    }        
     vdhp->codec_id             = AV_CODEC_ID_NONE;
     adhp->codec_id             = AV_CODEC_ID_NONE;
     vdhp->initial_pix_fmt      = AV_PIX_FMT_NONE;
@@ -2996,6 +3063,7 @@ static int parse_index
     int      audio_sample_rate     = 0;
     int      constant_frame_length = 1;
     uint64_t audio_duration        = 0;
+    int consistent_field_and_repeat = 0;
     char buf[1024];
     if( !fgets( buf, sizeof(buf), index ) )
         goto fail_parsing;
@@ -3039,7 +3107,7 @@ static int parse_index
         int64_t pos;
         int64_t pts;
         int64_t dts;
-        if( sscanf( buf, "Index=%d,POS=%" SCNd64 ",PTS=%" SCNd64 ",DTS=%" SCNd64 ",EDI=%d",
+        if( sscanf_unrolled_main_index( buf, // "Index=%d,POS=%" SCNd64 ",PTS=%" SCNd64 ",DTS=%" SCNd64 ",EDI=%d",
                     &stream_index, &pos, &pts, &dts, &extradata_index ) != 5 )
             goto fail_parsing;
         if( !fgets( buf, sizeof(buf), index ) )
@@ -3071,7 +3139,7 @@ static int parse_index
                 int   poc;
                 int   repeat_pict;
                 int   field_info;
-                if( sscanf( buf, "Key=%d,Pic=%d,POC=%d,Repeat=%d,Field=%d",
+                if( sscanf_unrolled_video_index( buf, // "Key=%d,Pic=%d,POC=%d,Repeat=%d,Field=%d",
                             &key, &pict_type, &poc, &repeat_pict, &field_info ) != 5 )
                     goto fail_parsing;
                 if( vdhp->codec_id == AV_CODEC_ID_NONE )
@@ -3153,7 +3221,8 @@ static int parse_index
                 char    *sample_fmt      = stream_info[stream_index].fmt;
                 int      bits_per_sample = stream_info[stream_index].bits_per_sample;
                 int      frame_length;
-                if( sscanf( buf, "Length=%d", &frame_length ) != 1 )
+                if( sscanf_unrolled_audio_index( buf, // "Length=%d",
+                            &frame_length ) != 1 )
                     goto fail_parsing;
                 if( adhp->codec_id == AV_CODEC_ID_NONE )
                     adhp->codec_id = (enum AVCodecID)codec_id;
@@ -3222,6 +3291,15 @@ static int parse_index
     if( audio_present && opt->force_audio && opt->force_audio_index != -1 && (audio_sample_count == 0 || audio_duration == 0) )
         goto fail_parsing;  /* Need to re-create the index file. */
     if( strncmp( buf, "</LibavReaderIndex>", strlen( "</LibavReaderIndex>" ) ) )
+        goto fail_parsing;
+    if (!fgets(buf, sizeof(buf), index))
+        goto fail_parsing;
+    if (!strncmp(buf, "<VideoConsistentFieldRepeatPict>", strlen("<VideoConsistentFieldRepeatPict>")))
+    {
+        if (sscanf(buf, "<VideoConsistentFieldRepeatPict>%d</VideoConsistentFieldRepeatPict>", &consistent_field_and_repeat) != 1)
+            goto fail_parsing;
+    }
+    else
         goto fail_parsing;
     /* Parse stream durations. */
     if( !fgets( buf, sizeof(buf), index ) )
@@ -3402,7 +3480,7 @@ static int parse_index
             /* Compute the stream duration. */
             compute_stream_duration( lwhp, vdhp, vdhp->stream_duration );
             /* Create the repeat control info. */
-            create_video_frame_order_list( vdhp, vohp, opt );
+            create_video_frame_order_list( vdhp, vohp, opt, consistent_field_and_repeat );
             /* Exclude invisible frames from the output handler. */
             create_video_visible_frame_list( vdhp, vohp, invisible_count );
         }

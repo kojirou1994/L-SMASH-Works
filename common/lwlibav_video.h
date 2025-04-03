@@ -20,6 +20,8 @@
 
 /* This file is available under an ISC license. */
 
+#include "video_output.h"
+
 /*****************************************************************************
  * Opaque Handlers
  *****************************************************************************/
@@ -100,7 +102,7 @@ void lwlibav_video_set_preferred_decoder_names
 void lwlibav_video_set_prefer_hw_decoder
 (
     lwlibav_video_decode_handler_t *vdhp,
-    int                             prefer_hw_decoder
+    int                            *prefer_hw_decoder
 );
 
 void lwlibav_video_set_decoder_options

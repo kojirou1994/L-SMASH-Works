@@ -1,3 +1,5 @@
+#pragma once
+
 /*****************************************************************************
  * video_output.h
  *****************************************************************************
@@ -101,6 +103,12 @@ int update_scaler_configuration_if_needed
 void lw_cleanup_video_output_handler
 (
     lw_video_output_handler_t *vohp
+);
+
+int transfer_frame_data
+(
+    AVFrame* dst,
+    AVFrame* src
 );
 
 #ifdef __cplusplus
