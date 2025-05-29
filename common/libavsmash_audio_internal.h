@@ -20,19 +20,25 @@
 
 /* This file is available under an ISC license. */
 
-struct libavsmash_audio_decode_handler_tag
-{
-    lsmash_root_t        *root;
-    uint32_t              track_id;
+#ifndef LIBAVSMASH_AUDIO_INTERNAL_H
+#define LIBAVSMASH_AUDIO_INTERNAL_H
+
+#include "libavsmash.h"
+
+struct libavsmash_audio_decode_handler_tag {
+    lsmash_root_t* root;
+    uint32_t track_id;
     codec_configuration_t config;
-    AVFrame              *frame_buffer;
-    AVPacket              packet;
-    uint64_t              pcm_sample_count;
-    uint64_t              next_pcm_sample_number;
-    uint32_t              last_frame_number;
-    uint32_t              frame_count;
-    int                   implicit_preroll;
-    uint32_t              media_timescale;
-    uint64_t              media_duration;   /* unused */
-    uint64_t              min_cts;
+    AVFrame* frame_buffer;
+    AVPacket packet;
+    uint64_t pcm_sample_count;
+    uint64_t next_pcm_sample_number;
+    uint32_t last_frame_number;
+    uint32_t frame_count;
+    int implicit_preroll;
+    uint32_t media_timescale;
+    uint64_t media_duration; /* unused */
+    uint64_t min_cts;
 };
+
+#endif // !LIBAVSMASH_AUDIO_INTERNAL_H

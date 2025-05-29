@@ -20,18 +20,21 @@
 
 /* This file is available under an ISC license. */
 
+#ifndef PROGRESS_H
+#define PROGRESS_H
+
 #ifdef NO_PROGRESS_HANDLER
-struct progress_handler_tag
-{
+struct progress_handler_tag {
     int dummy;
 };
 #endif
 
 typedef struct progress_handler_tag progress_handler_t;
 
-typedef struct
-{
-    void (*open)  ( progress_handler_t *hp );
-    int  (*update)( progress_handler_t *hp, const char *message, int percent );
-    void (*close )( progress_handler_t *hp );
+typedef struct {
+    void (*open)(progress_handler_t* hp);
+    int (*update)(progress_handler_t* hp, const char* message, int percent);
+    void (*close)(progress_handler_t* hp);
 } progress_indicator_t;
+
+#endif // !PROGRESS_H
